@@ -1,149 +1,137 @@
-import requests
+import asyncio
+import inspect
+import io
+from typing import Callable, Optional
+
+import edge_tts
 import pygame
-import time
-import os
-from dotenv import load_dotenv
+from edge_tts.exceptions import NoAudioReceived
 
-load_dotenv()
-
-# Set your ElevenLabs API key from environment variable
-ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
-
-OUTPUT_FILE = "output.mp3"
 pygame.mixer.init()
 
-# Jessica's voice ID
-JESSICA_VOICE_ID = "cgSgspJ2msm6clMCkdW9"
+PRIMARY_VOICE = "en-IE-EmilyNeural"
+FALLBACK_VOICES = [
+    "en-US-AriaNeural",
+    "en-US-JennyNeural",
+]
+SPEECH_RATE = "+5%"
+SPEECH_VOLUME = "+0%"
+SPEECH_PITCH = "+0Hz"
 
-# ElevenLabs API endpoint
-ELEVENLABS_API_URL = f"https://api.elevenlabs.io/v1/text-to-speech/{JESSICA_VOICE_ID}"
 
-
-def speak(text):
-    """
-    Generate speech with Jessica's voice
-    (Eloquent Villain - Character voice)
-    """
-    
-    if not text.strip():
+async def _emit_lip(
+    lip_callback: Optional[Callable[[float], object]],
+    value: float,
+) -> None:
+    if lip_callback is None:
         return
-    
-    print(f"🎤 Generating speech with Jessica's voice...")
-    start = time.time()
-    
-    try:
-        headers = {
-            "Accept": "audio/mpeg",
-            "Content-Type": "application/json",
-            "xi-api-key": ELEVENLABS_API_KEY
-        }
-        
-        data = {
-            "text": text,
-            "model_id": "eleven_multilingual_v2",
-            "voice_settings": {
-                "stability": 0.5,
-                "similarity_boost": 0.75,
-                "style": 0.5,
-                "use_speaker_boost": True
-            }
-        }
-        
-        response = requests.post(ELEVENLABS_API_URL, json=data, headers=headers)
-        response.raise_for_status()
-        
-        # Unload any existing music first
-        pygame.mixer.music.unload()
-        
-        # Save audio
-        with open(OUTPUT_FILE, "wb") as f:
-            f.write(response.content)
-        
-        elapsed = time.time() - start
-        print(f"⏱️ Generated in {elapsed:.2f}s")
-        
-        # Play audio
-        print("🔊 Playing...")
-        pygame.mixer.music.load(OUTPUT_FILE)
-        pygame.mixer.music.play()
-        
-        while pygame.mixer.music.get_busy():
-            pygame.time.Clock().tick(10)
-        
-        # Unload music to release file
-        pygame.mixer.music.unload()
-        time.sleep(0.1)  # Small delay to ensure file is released
-        
-        print("✅ Done!\n")
-        
-    except Exception as e:
-        print(f"❌ Error: {e}")
+    maybe_awaitable = lip_callback(value)
+    if inspect.isawaitable(maybe_awaitable):
+        await maybe_awaitable
 
 
-def speak_with_emotion(text, emotion="neutral"):
-    """
-    Speak with different emotions
-    emotion: "neutral", "excited", "calm", "dramatic"
-    """
-    
-    if not text.strip():
+async def _stream_audio_and_word_boundaries(
+    text: str,
+    voice: str,
+) -> tuple[bytes, list[float]]:
+    communicate = edge_tts.Communicate(
+        text,
+        voice,
+        rate=SPEECH_RATE,
+        volume=SPEECH_VOLUME,
+        pitch=SPEECH_PITCH,
+        boundary="WordBoundary",  # Required for lip sync timing
+        connect_timeout=5,
+        receive_timeout=10,
+    )
+    audio_data = b""
+    word_offsets_sec = []
+    async for chunk in communicate.stream():
+        if chunk["type"] == "audio":
+            audio_data += chunk["data"]
+        elif chunk["type"] == "WordBoundary":
+            # Edge offset is in 100-ns ticks.
+            offset_ticks = chunk.get("offset")
+            if isinstance(offset_ticks, int):
+                word_offsets_sec.append(offset_ticks / 10_000_000.0)
+    return audio_data, word_offsets_sec
+
+
+async def _drive_lip_from_word_boundaries(
+    word_offsets_sec: list[float],
+    lip_callback: Optional[Callable[[float], object]],
+) -> None:
+    if lip_callback is None:
         return
-    
-    emotion_settings = {
-        "neutral": {"stability": 0.5, "style": 0.5},
-        "excited": {"stability": 0.3, "style": 0.8},
-        "calm": {"stability": 0.7, "style": 0.3},
-        "dramatic": {"stability": 0.4, "style": 0.9}
-    }
-    
-    settings = emotion_settings.get(emotion, emotion_settings["neutral"])
-    
+    if not word_offsets_sec:
+        while pygame.mixer.get_busy():
+            await _emit_lip(lip_callback, 0.08)
+            await asyncio.sleep(0.03)
+        await _emit_lip(lip_callback, 0.0)
+        return
+
+    loop = asyncio.get_running_loop()
+    last_index = 0
+    start = loop.time()
+    while pygame.mixer.get_busy():
+        now = loop.time() - start
+        while last_index + 1 < len(word_offsets_sec) and word_offsets_sec[last_index + 1] <= now:
+            last_index += 1
+
+        nearest = word_offsets_sec[last_index]
+        delta = abs(now - nearest)
+        if delta < 0.10:
+            lip_value = max(0.2, 1.0 - (delta / 0.10))
+        else:
+            lip_value = 0.06
+        await _emit_lip(lip_callback, lip_value)
+        await asyncio.sleep(0.03)
+
+    await _emit_lip(lip_callback, 0.0)
+
+
+async def speak_realtime(
+    text: str,
+    lip_callback: Optional[Callable[[float], object]] = None,
+):
+    """Async TTS with fallback voices, safe failure handling, and optional lip callback."""
+    last_error = None
+
+    for voice in [PRIMARY_VOICE, *FALLBACK_VOICES]:
+        try:
+            audio_data, word_offsets_sec = await _stream_audio_and_word_boundaries(text, voice)
+            if not audio_data:
+                raise NoAudioReceived("No audio bytes returned from TTS stream.")
+
+            sound = pygame.mixer.Sound(io.BytesIO(audio_data))
+            sound.play()
+            await _drive_lip_from_word_boundaries(word_offsets_sec, lip_callback)
+            return
+        except NoAudioReceived as exc:
+            last_error = exc
+            continue
+        except Exception as exc:
+            last_error = exc
+            continue
+
+    if last_error:
+        print(f"[TTS warning] Could not synthesize speech: {last_error}")
+
+
+def speak(text: str, lip_callback: Optional[Callable[[float], object]] = None):
+    """Synchronous wrapper for main.py."""
+    if not text or not text.strip():
+        return
     try:
-        headers = {
-            "Accept": "audio/mpeg",
-            "Content-Type": "application/json",
-            "xi-api-key": ELEVENLABS_API_KEY
-        }
-        
-        data = {
-            "text": text,
-            "model_id": "eleven_multilingual_v2",
-            "voice_settings": {
-                "stability": settings["stability"],
-                "similarity_boost": 0.75,
-                "style": settings["style"],
-                "use_speaker_boost": True
-            }
-        }
-        
-        response = requests.post(ELEVENLABS_API_URL, json=data, headers=headers)
-        response.raise_for_status()
-        
-        # Unload any existing music first
-        pygame.mixer.music.unload()
-        
-        with open(OUTPUT_FILE, "wb") as f:
-            f.write(response.content)
-        
-        pygame.mixer.music.load(OUTPUT_FILE)
-        pygame.mixer.music.play()
-        
-        while pygame.mixer.music.get_busy():
-            pygame.time.Clock().tick(10)
-        
-        # Unload music to release file
-        pygame.mixer.music.unload()
-        time.sleep(0.1)  # Small delay to ensure file is released
-        
-    except Exception as e:
-        print(f"❌ Error: {e}")
+        asyncio.run(speak_realtime(text, lip_callback=lip_callback))
+    except RuntimeError:
+        # Handles event-loop conflicts on some Python environments.
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(speak_realtime(text, lip_callback=lip_callback))
+        finally:
+            loop.close()
 
 
 if __name__ == "__main__":
-    # Test Jessica's voice
-    speak("Hello! I'm Jessica, your AI assistant with this elegant voice!")
-    
-    # Test with different emotions
-    speak_with_emotion("This is exciting news!", emotion="excited")
-    speak_with_emotion("Let me explain this calmly.", emotion="calm")
-    speak_with_emotion("This is absolutely dramatic!", emotion="dramatic")
+    speak("Hello karthick, I'm ready to talk!")
