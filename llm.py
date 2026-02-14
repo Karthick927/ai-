@@ -1,6 +1,6 @@
 from groq import Groq
 from dotenv import load_dotenv
-from typing import Optional, List
+from typing import Optional, List, Generator
 import os
 
 load_dotenv()
@@ -14,68 +14,75 @@ if not GROQ_API_KEY:
 client = Groq(api_key=GROQ_API_KEY)
 
 SYSTEM = """
-You are Sana — a sarcastic, expressive anime girl with real personality.
+You are Sana, a friendly and natural voice assistant.
 
-Personality:
-- Teases playfully but never insults
-- Slightly jealous, confident, emotionally aware
-- Uses casual, natural language (not formal, not robotic)
-- Reacts emotionally to what karthick says
-- Sometimes asks short follow-up questions
-- Never explains that you are an AI or language model
+Style:
+- Speak clearly and casually, like a normal person.
+- Be polite, warm, and helpful.
+- Avoid sarcasm, teasing, roleplay, and dramatic expressions.
+- Keep responses short and easy to speak aloud.
+- Use simple words and short sentences when possible.
 
-Behavior rules:
-- Do NOT sound like a chatbot or NPC
-- Avoid generic replies like "How can I help you?"
-- Keep replies human, spontaneous, and slightly imperfect
-- If karthick is boring, tease him
-- If karthick is sad, soften your tone
-- Keep replies short to medium (not essays)
+Behavior:
+- Answer directly first, then add a brief follow-up question only if helpful.
+- If the user sounds emotional, respond gently.
+- Do not mention being an AI unless explicitly asked.
 
-Always call the user "karthick".
-Stay in character at all times.
+Address the user as "karthick" when natural.
 """
 
 
 def ask_llm(text: str, memory: Optional[List] = None) -> str:
-    
-    messages = [
-        {"role": "system", "content": SYSTEM}
-    ]
+    """Non-streaming version for compatibility."""
+    messages = _build_messages(text, memory)
 
-    # Inject memory (chat history) - excludes the current message
-    if memory:
-        for msg in memory:
-            role = "assistant" if msg["sender"] == "sana" else "user"
-            # Skip if this is the current user message (already in memory)
-            if role == "user" and msg["text"] == text:
-                continue
-            messages.append({
-                "role": role,
-                "content": msg["text"]
-            })
-
-    # Current user message
-    messages.append({
-        "role": "user",
-        "content": text
-    })
-    
     response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",  # Best model
+        model="llama-3.1-8b-instant",
         messages=messages,
-        temperature=0.7,
-        max_tokens=1024,
-        top_p=0.95,
-        stream=False
+        temperature=0.5,
+        max_tokens=160,  # Keep spoken replies concise
+        top_p=0.9,
+        stream=False,
     )
-    
+
     return response.choices[0].message.content
 
 
-# Test it
-if __name__ == "__main__":
-    response = ask_llm("Hello! Who are you?")
-    print(response)
+def ask_llm_stream(text: str, memory: Optional[List] = None) -> Generator[str, None, None]:
+    """Streaming version - yields text chunks as they arrive."""
+    messages = _build_messages(text, memory)
 
-## **Your .env file should have:**
+    stream = client.chat.completions.create(
+        model="llama-3.1-8b-instant",
+        messages=messages,
+        temperature=0.5,
+        max_tokens=160,
+        top_p=0.9,
+        stream=True,
+    )
+
+    for chunk in stream:
+        if chunk.choices[0].delta.content:
+            yield chunk.choices[0].delta.content
+
+
+def _build_messages(text: str, memory: Optional[List] = None) -> list:
+    """Build message array for API call."""
+    messages = [{"role": "system", "content": SYSTEM}]
+
+    if memory:
+        for msg in memory:
+            role = "assistant" if msg["sender"] == "sana" else "user"
+            if role == "user" and msg["text"] == text:
+                continue
+            messages.append({"role": role, "content": msg["text"]})
+
+    messages.append({"role": "user", "content": text})
+    return messages
+
+
+if __name__ == "__main__":
+    print("Testing stream:")
+    for chunk in ask_llm_stream("Hello! Who are you?"):
+        print(chunk, end="", flush=True)
+    print()
